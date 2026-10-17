@@ -613,6 +613,22 @@ function Stat({ label, value, note, color }) {
 
 function AdminView({ d }) {
   const [override, setOverride] = useState("idle");
+  // FUNGSI BARU: Mengubah tampilan UI dan melakukan HTTP PATCH ke Firebase
+  const handleOverride = async (newState) => {
+    setOverride(newState); // Mengubah visual tombol
+    const isActive = newState === "engaged";
+    try {
+      await fetch("https://bionets-abaa9-default-rtdb.asia-southeast1.firebasedatabase.app/kontrol.json", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ manual_aktif: isActive })
+      });
+      console.log("Perintah dikirim ke Firebase. manual_aktif:", isActive);
+    } catch (err) {
+      console.error("Gagal mengirim perintah ke Firebase:", err);
+    }
+  };
+
   const bearing = bearingOf(d);
   const lvl = overall(d);
   const s = SCALE[lvl];
@@ -631,7 +647,6 @@ function AdminView({ d }) {
           {d.tankPct != null && d.tankPct < 30 && " Cadangan cairan menipis, rencanakan pengisian ulang."}
         </p>
       </Panel>
-
       <div className="lg:col-span-3 flex flex-col gap-4 sm:gap-6">
         <Panel title="Kualitas udara" aside={<Activity size={18} className="text-slate-500" />}>
           <ArcGauge value={d.so2} label="Sulfur dioksida (SO₂)" unit="ppm" limits={LIMITS.so2} />
@@ -658,7 +673,8 @@ function AdminView({ d }) {
             <Actuator icon={Fan} name="Blower fan" on={!!d.blower} offText="Mati" />
           </div>
         </Panel>
-        <Panel title="Kendali manual"><OverrideButton state={override} setState={setOverride} /></Panel>
+        {/* BAGIAN YANG DIUBAH: Memanggil handleOverride */}
+        <Panel title="Kendali manual"><OverrideButton state={override} setState={handleOverride} /></Panel>
       </div>
     </main>
   );
