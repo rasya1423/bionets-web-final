@@ -618,12 +618,12 @@ function AdminView({ d }) {
     setOverride(newState); // Mengubah visual tombol
     const isActive = newState === "engaged";
     try {
-      await fetch("https://bionets-abaa9-default-rtdb.asia-southeast1.firebasedatabase.app/kontrol.json", {
+      await fetch("https://bionets-abaa9-default-rtdb.asia-southeast1.firebasedatabase.app/control.json", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ manual_aktif: isActive })
+        body: JSON.stringify({ mode: isActive ? "MANUAL ON" : "Auto" })
       });
-      console.log("Perintah dikirim ke Firebase. manual_aktif:", isActive);
+      console.log("Perintah dikirim ke Firebase. mode:", isActive ? "MANUAL ON" : "Auto");
     } catch (err) {
       console.error("Gagal mengirim perintah ke Firebase:", err);
     }
