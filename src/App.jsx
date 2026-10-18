@@ -613,19 +613,26 @@ function Stat({ label, value, note, color }) {
 
 function AdminView({ d }) {
   const [override, setOverride] = useState("idle");
-  // FUNGSI BARU: Mengubah tampilan UI dan melakukan HTTP PATCH ke Firebase
+
+  // Mengirim perintah Manual Override ke /control.json milik ESP32
   const handleOverride = async (newState) => {
-    setOverride(newState); // Mengubah visual tombol
+    setOverride(newState);
+    if (newState === "armed") return; // Tunggu konfirmasi klik kedua
+
     const isActive = newState === "engaged";
     try {
       await fetch("https://bionets-abaa9-default-rtdb.asia-southeast1.firebasedatabase.app/control.json", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: isActive ? "MANUAL ON" : "Auto" })
+        body: JSON.stringify({
+          mode: isActive ? "MANUAL_ON" : "AUTO",
+          manual_aktif: isActive,
+          timestamp: Date.now()
+        })
       });
-      console.log("Perintah dikirim ke Firebase. mode:", isActive ? "MANUAL ON" : "Auto");
+      console.log("Override berhasil dikirim:", isActive ? "MANUAL_ON" : "AUTO");
     } catch (err) {
-      console.error("Gagal mengirim perintah ke Firebase:", err);
+      console.error("Gagal mengirim perintah override:", err);
     }
   };
 
@@ -633,6 +640,8 @@ function AdminView({ d }) {
   const lvl = overall(d);
   const s = SCALE[lvl];
   const litres = d.tankPct == null ? "--" : ((d.tankPct / 100) * TANK_CAP).toFixed(2).replace(".", ",");
+  const isManual = override === "engaged";
+
   return (
     <main className="max-w-screen-2xl mx-auto p-4 sm:p-6 grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6">
       <Panel title="Kesimpulan dan overview status" className="lg:col-span-12" aside={<ClipboardCheck size={18} className="text-slate-500" />}>
@@ -640,13 +649,14 @@ function AdminView({ d }) {
           <Stat label="Status keseluruhan" value={s.label} note="Ditentukan gas tertinggi" color={s.hex} />
           <Stat label="SO₂ saat ini" value={`${fmt1(d.so2)} ppm`} note={`Ambang bahaya ${LIMITS.so2.danger} ppm`} color={d.so2 == null ? "#64748b" : TONE[level(d.so2, LIMITS.so2)].hex} />
           <Stat label="Cairan tersisa" value={`${litres} L`} note={`${d.tankPct ?? "--"}% dari ${TANK_CAP} L`} color={d.tankPct == null ? "#64748b" : d.tankPct > 30 ? "#22d3ee" : "#facc15"} />
-          <Stat label="Mode aktuator" value={override === "engaged" ? "Manual" : "Otomatis"} note={bearing == null ? "Arah angin tidak tersedia" : `Tiupan menuju ${bearing}° (${compass(bearing)})`} color={override === "engaged" ? "#ef4444" : "#22d3ee"} />
+          <Stat label="Mode aktuator" value={isManual ? "Manual" : "Otomatis"} note={bearing == null ? "Arah angin tidak tersedia" : `Tiupan menuju ${bearing}° (${compass(bearing)})`} color={isManual ? "#ef4444" : "#22d3ee"} />
         </div>
         <p className="mt-4 text-slate-200">
           <span className="font-semibold text-slate-50">Rekomendasi: </span>{REKOMENDASI[lvl]}
           {d.tankPct != null && d.tankPct < 30 && " Cadangan cairan menipis, rencanakan pengisian ulang."}
         </p>
       </Panel>
+
       <div className="lg:col-span-3 flex flex-col gap-4 sm:gap-6">
         <Panel title="Kualitas udara" aside={<Activity size={18} className="text-slate-500" />}>
           <ArcGauge value={d.so2} label="Sulfur dioksida (SO₂)" unit="ppm" limits={LIMITS.so2} />
@@ -668,12 +678,12 @@ function AdminView({ d }) {
         <Panel title="Tangki eco-alkaline 5,5 L"><Tank pct={d.tankPct} cap={TANK_CAP} /></Panel>
         <Panel title="Status aktuator">
           <div className="flex flex-col gap-3">
-            <Actuator icon={Droplets} name="Pompa misting (mist cannon)" on={d.pump ?? override === "engaged"} offText="Siaga" />
-            <Actuator icon={Zap} name="Solenoid valve" on={d.solenoid ?? override === "engaged"} onText="Terbuka" offText="Tertutup" />
-            <Actuator icon={Fan} name="Blower fan" on={!!d.blower} offText="Mati" />
+            {/* Menggunakan operator || agar indikator langsung menyala begitu override aktif maupun saat ESP32 merespons */}
+            <Actuator icon={Droplets} name="Pompa misting (mist cannon)" on={Boolean(d.pump || isManual)} offText="Siaga" />
+            <Actuator icon={Zap} name="Solenoid valve" on={Boolean(d.solenoid || isManual)} onText="Terbuka" offText="Tertutup" />
+            <Actuator icon={Fan} name="Blower fan" on={Boolean(d.blower || isManual)} offText="Mati" />
           </div>
         </Panel>
-        {/* BAGIAN YANG DIUBAH: Memanggil handleOverride */}
         <Panel title="Kendali manual"><OverrideButton state={override} setState={handleOverride} /></Panel>
       </div>
     </main>
