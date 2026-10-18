@@ -1,19 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   Activity, Droplets, Fan, Mountain, Siren, Thermometer, TriangleAlert, Wind, Zap, Droplet, Radio,
-  LogIn, LogOut, History as HistoryIcon, X, ShieldCheck, UserRound, Home, ClipboardCheck,
+  LogIn, LogOut, History as HistoryIcon, X, ShieldCheck, UserRound, Home, ClipboardCheck, Trash2,
 } from "lucide-react";
 
-/* ---------- Telemetri Firebase ---------- */
-const ENDPOINT = "https://bionets-abaa9-default-rtdb.asia-southeast1.firebasedatabase.app/telemetry.json";
+/* ---------- Telemetri & Riwayat Firebase ---------- */
+const DB_BASE = "https://bionets-abaa9-default-rtdb.asia-southeast1.firebasedatabase.app";
+const ENDPOINT = `${DB_BASE}/telemetry.json`;
+const LOGS_ENDPOINT = `${DB_BASE}/logs.json`;
+const CONTROL_ENDPOINT = `${DB_BASE}/control.json`;
+
 const POLL_MS = 2000;
 const TIMEOUT_MS = 6000;
-const OFFLINE_AFTER = 3; // gagal beruntun sebelum dianggap terputus
-const STALE_AFTER_S = 30; // umur timestamp node sebelum data dianggap basi
+const OFFLINE_AFTER = 3;
+const STALE_AFTER_S = 30;
 const TANK_CAP = 5.5;
 
-// Satu-satunya tempat pemetaan JSON -> UI. Jalur pertama tiap daftar dicoba lebih dulu.
-// Terkonfirmasi: tangki.persen, sensor_udara.so2_ppm. Sisanya TEBAKAN, samakan dengan JSON Gemini.
 const PATHS = {
   so2: ["sensor_udara.so2_ppm"],
   h2s: ["sensor_udara.h2s_ppm"],
@@ -22,11 +24,14 @@ const PATHS = {
   windFrom: ["angin.arah_derajat", "angin.arah"],
   windSpeed: ["angin.kecepatan_ms", "angin.kecepatan"],
   tankPct: ["tangki.persen"],
+  tankCm: ["tangki.jarak_cm"],
   pump: ["aktuator.pompa_misting", "aktuator.pompa"],
   solenoid: ["aktuator.solenoid"],
   blower: ["aktuator.blower"],
-  ts: ["timestamp", "waktu"], // epoch milidetik; opsional, dipakai untuk deteksi data basi
+  mode: ["aktuator.mode_kendali"],
+  ts: ["timestamp", "waktu"],
 };
+
 const dig = (o, path) => path.split(".").reduce((x, k) => (x == null ? undefined : x[k]), o);
 const first = (o, paths) => { for (const p of paths) { const v = dig(o, p); if (v !== undefined && v !== null) return v; } return null; };
 const toNum = (v) => { const n = typeof v === "string" ? parseFloat(v.replace(",", ".")) : v; return Number.isFinite(n) ? n : null; };
@@ -37,12 +42,34 @@ function mapTelemetry(raw) {
   const b = (k) => toBool(first(raw, PATHS[k]));
   return {
     so2: n("so2"), h2s: n("h2s"), temp: n("temp"), hum: n("hum"),
-    windFrom: n("windFrom"), windSpeed: n("windSpeed"), tankPct: n("tankPct"),
-    pump: b("pump"), solenoid: b("solenoid"), blower: b("blower"), ts: n("ts"),
+    windFrom: n("windFrom"), windSpeed: n("windSpeed"), tankPct: n("tankPct"), tankCm: n("tankCm"),
+    pump: b("pump"), solenoid: b("solenoid"), blower: b("blower"),
+    mode: first(raw, PATHS.mode), ts: n("ts"),
   };
 }
 
-// Polling berurutan (setTimeout rekursif): tidak ada request menumpuk, berhenti saat tab tersembunyi.
+const nowClockWIB = () =>
+  new Date().toLocaleTimeString("id-ID", { timeZone: "Asia/Jakarta", hour: "2-digit", minute: "2-digit", hour12: false }).replace(/\./g, ":");
+
+async function pushFirebaseLog(ev, src, on, so2) {
+  try {
+    await fetch(LOGS_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        t: nowClockWIB(),
+        ev,
+        src,
+        on: Boolean(on),
+        so2: Number.isFinite(so2) ? Number(so2.toFixed(1)) : 0.3,
+        ts: Date.now(),
+      }),
+    });
+  } catch (e) {
+    console.error("Gagal mencatat riwayat:", e);
+  }
+}
+
 function useTelemetry(enabled) {
   const [st, setSt] = useState({ raw: null, status: "loading", updatedAt: null, fails: 0, error: "" });
   useEffect(() => {
@@ -54,7 +81,7 @@ function useTelemetry(enabled) {
       const killer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
       try {
         const res = await fetch(ENDPOINT, { method: "GET", cache: "no-store", signal: ctrl.signal });
-        if (!res.ok) throw new Error(res.status === 401 || res.status === 403 ? "Akses ditolak oleh aturan database (HTTP " + res.status + ")" : "HTTP " + res.status);
+        if (!res.ok) throw new Error("HTTP " + res.status);
         const json = await res.json();
         if (json == null) throw new Error("Node /telemetry masih kosong");
         if (alive) setSt({ raw: json, status: "live", updatedAt: new Date(), fails: 0, error: "" });
@@ -72,12 +99,52 @@ function useTelemetry(enabled) {
   return st;
 }
 
+// Hook Real-Time untuk Riwayat Kejadian dari Firebase (/logs.json)
+function useRealtimeLogs(open) {
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const fetchLogs = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(LOGS_ENDPOINT, { cache: "no-store" });
+      const data = await res.json();
+      if (!data) {
+        setLogs([]);
+      } else {
+        const arr = Object.entries(data)
+          .map(([id, val]) => ({ id, ...val }))
+          .sort((a, b) => (b.ts || 0) - (a.ts || 0))
+          .slice(0, 25);
+        setLogs(arr);
+      }
+    } catch (e) {
+      console.error("Gagal memuat riwayat:", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    fetchLogs();
+    const t = setInterval(fetchLogs, 3000);
+    return () => clearInterval(t);
+  }, [open]);
+
+  const clearLogs = async () => {
+    await fetch(LOGS_ENDPOINT, { method: "DELETE" });
+    setLogs([]);
+  };
+
+  return { logs, loading, clearLogs };
+}
+
 const fmt1 = (v) => (v == null ? "--" : v.toFixed(1).replace(".", ","));
 const pctOf = (v, max) => (v == null ? 0 : Math.min(Math.max((v / max) * 100, 0), 100));
 const bearingOf = (d) => (d.windFrom == null ? null : (d.windFrom + 180) % 360);
 const clockOf = (dt) => (dt ? dt.toLocaleTimeString("id-ID", { timeZone: "Asia/Jakarta", hour12: false }).replace(/\./g, ":") : "-");
 
-// Ambang di bawah hanya placeholder visual; sesuaikan dengan standar BPBD/PVMBG.
 const LIMITS = { so2: { warn: 2, danger: 5, max: 10 }, h2s: { warn: 1, danger: 5, max: 10 } };
 
 const TONE = {
@@ -178,7 +245,6 @@ function WindCompass({ from, speed }) {
           const r = 44, x = 110 + r * Math.sin((a * Math.PI) / 180) * (62 / 44), y = 110 - r * Math.cos((a * Math.PI) / 180) * (62 / 44);
           return <text key={l} x={x} y={y + 5} textAnchor="middle" fill={l === "U" ? "#f87171" : "#cbd5e1"} fontSize="15" fontWeight="600" className="bn-display">{l}</text>;
         })}
-        {/* jarum: ekor di sisi asal angin, kepala ke arah tiupan */}
         {has && <g transform={`rotate(${from + 180} 110 110)`}>
           <path d="M110 34 L120 110 L110 100 L100 110 Z" fill="#facc15" />
           <path d="M110 186 L116 110 L104 110 Z" fill="#475569" />
@@ -188,7 +254,7 @@ function WindCompass({ from, speed }) {
       <div>
         <div className="bn-display text-5xl font-semibold text-slate-100 leading-none">{has ? `${from}°` : "--"}</div>
         <div className="text-slate-300 mt-1">{has ? `dari ${compass(from)}` : "Arah tidak tersedia"}</div>
-        <div className="bn-display text-3xl text-yellow-400 mt-3 leading-none">{speed ?? "--"}<span className="text-base text-slate-400 ml-1">m/s</span></div>
+        <div className="bn-display text-3xl text-yellow-400 mt-3 leading-none">{fmt1(speed)}<span className="text-base text-slate-400 ml-1">m/s</span></div>
         <div className="text-xs text-slate-500 mt-2">{has ? `Tiupan menuju ${Math.round((from + 180) % 360)}°` : "Menunggu data angin"}</div>
       </div>
     </div>
@@ -213,13 +279,11 @@ function SpatialRadar({ bearing }) {
         </defs>
         <circle cx="200" cy="200" r="184" fill="#080d13" />
         <g clipPath="url(#bn-disc)">
-          {/* grid */}
           {Array.from({ length: 9 }, (_, i) => (
             <g key={i} stroke="#162231" strokeWidth="1">
               <line x1={i * 50} y1="0" x2={i * 50} y2="400" /><line x1="0" y1={i * 50} x2="400" y2={i * 50} />
             </g>
           ))}
-          {/* plume mengikuti arah tiupan */}
           {bearing != null && <g transform={`rotate(${bearing} 200 200)`}>
             <path d="M200 200 L150 30 Q200 4 250 30 Z" fill="url(#bn-plume)" />
             <circle cx="200" cy="96" r="34" fill="#facc15" opacity=".14" />
@@ -232,13 +296,11 @@ function SpatialRadar({ bearing }) {
               </g>
             </g>
           </g>}
-          {/* sapuan radar */}
           <g className="bn-sweep"><path d="M200 200 L200 16 A184 184 0 0 1 330 70 Z" fill="url(#bn-sweepfill)" /></g>
         </g>
         {[46, 92, 138, 184].map((r) => (
           <circle key={r} cx="200" cy="200" r={r} fill="none" stroke="#2b3a4d" strokeWidth="1" strokeDasharray={r === 184 ? "0" : "3 5"} />
         ))}
-        {/* node sumber */}
         <circle className="bn-ping" cx="200" cy="200" r="40" fill="none" stroke="#22d3ee" strokeWidth="2" />
         <circle cx="200" cy="200" r="6" fill="#22d3ee" />
         <text x="212" y="222" fill="#94a3b8" fontSize="12">Node ESP32</text>
@@ -248,14 +310,13 @@ function SpatialRadar({ bearing }) {
         <span>Rendah</span>
         <div className="h-1.5 flex-1" style={{ background: "linear-gradient(90deg,#22d3ee,#facc15,#ef4444)" }} />
         <span>Tinggi</span>
-        <span className="text-slate-500 ml-2">Placeholder, belum terhubung data spasial</span>
       </div>
     </div>
   );
 }
 
 /* ---------- Infrastruktur ---------- */
-function Tank({ pct, cap }) {
+function Tank({ pct, cap, cm }) {
   const v = pct ?? 0;
   const hex = pct == null ? "#475569" : v > 30 ? "#22d3ee" : v > 15 ? "#facc15" : "#ef4444";
   return (
@@ -272,7 +333,7 @@ function Tank({ pct, cap }) {
       <div className="pb-1">
         <div className="bn-display text-6xl font-semibold text-slate-100 leading-none">{pct ?? "--"}<span className="text-2xl text-slate-400">%</span></div>
         <div className="text-slate-300 mt-2">{pct == null ? "--" : ((pct / 100) * cap).toFixed(2).replace(".", ",")} L dari {cap} L</div>
-        <div className="text-xs text-slate-500 mt-1">Cairan eco-alkaline</div>
+        <div className="text-xs text-slate-500 mt-1">Cairan eco-alkaline {cm != null && cm > 0 ? `(Jarak sensor: ${fmt1(cm)} cm)` : ""}</div>
       </div>
     </div>
   );
@@ -324,7 +385,7 @@ function OverrideButton({ state, setState }) {
   );
 }
 
-/* ---------- RBAC: peran & data contoh ---------- */
+/* ---------- RBAC & Skala ---------- */
 const ROLES = {
   admin: { label: "Admin BPBD", badge: "Admin", cls: "border-yellow-400/60 text-yellow-300 bg-yellow-400/10" },
   citizen: { label: "Warga", badge: "Warga", cls: "border-cyan-400/60 text-cyan-300 bg-cyan-400/10" },
@@ -332,27 +393,16 @@ const ROLES = {
 const ORDER = ["safe", "warn", "danger"];
 const overall = (d) => {
   const lv = [d.so2 != null && level(d.so2, LIMITS.so2), d.h2s != null && level(d.h2s, LIMITS.h2s)].filter(Boolean);
-  if (!lv.length) return "warn"; // tanpa data gas, status dijaga di Waspada
+  if (!lv.length) return "warn";
   return lv.sort((a, b) => ORDER.indexOf(b) - ORDER.indexOf(a))[0];
 };
-
-// Data riwayat statis (contoh)
-const ADMIN_LOG = [
-  { t: "09:58", ev: "Pompa misting mati", src: "Otomatis, SO₂ turun di bawah 4 ppm", on: false },
-  { t: "09:42", ev: "Pompa misting aktif", src: "Manual override oleh Admin BPBD", on: true },
-  { t: "09:41", ev: "Solenoid valve terbuka", src: "Manual override oleh Admin BPBD", on: true },
-  { t: "08:15", ev: "Blower fan aktif", src: "Otomatis, SO₂ melewati 2 ppm", on: true },
-];
-const CITIZEN_LOG = [
-  { t: "09:42", so2: 5.1 }, { t: "12:25", so2: 4.6 }, { t: "06:10", so2: 3.8 }, { t: "15:03", so2: 2.9 },
-];
 
 const SCALE = {
   safe: { hex: "#34d399", text: "text-emerald-300", label: "Aman", Icon: ShieldCheck },
   warn: { hex: "#facc15", text: "text-yellow-400", label: "Waspada", Icon: TriangleAlert },
   danger: { hex: "#ef4444", text: "text-red-400", label: "Bahaya", Icon: Siren },
 };
-// Teks Madura = draf, wajib diverifikasi penutur asli sebelum dipakai di lapangan.
+
 const t = (mad, id) => ({ mad, id });
 const ADVICE = {
   safe: {
@@ -396,12 +446,12 @@ const ADVICE = {
 const REKOMENDASI = {
   safe: "Kondisi terkendali. Lanjutkan pemantauan rutin.",
   warn: `Siapkan mist cannon dan pastikan cairan mencukupi. Aktifkan manual bila SO₂ mencapai ${LIMITS.so2.danger} ppm. Informasikan petani belerang dan warga Sempol.`,
-  danger: "Aktifkan mist cannon sekarang, keluarkan instruksi evakuasi, dan koordinasikan dengan PVMBG serta aparat desa.",
+  danger: "URGENT: Aktifkan mist cannon sekarang, keluarkan instruksi evakuasi, dan koordinasikan dengan PVMBG serta aparat desa.",
 };
 
 const Footer = () => (
   <footer className="border-t border-slate-800 py-4 px-4 text-center text-xs text-slate-500">
-    © 2026 BIO-NETS - SMAN 2 Bondowoso. All Rights Reserved.
+    ©️ 2026 BIO-NETS - SMAN 2 Bondowoso. All Rights Reserved.
   </footer>
 );
 
@@ -448,7 +498,6 @@ function LoginPage({ onLogin }) {
               <button type="submit" className="w-full flex items-center justify-center gap-2 py-3 bg-yellow-400 hover:bg-yellow-300 text-gray-950 font-semibold focus:outline-none focus-visible:ring-4 focus-visible:ring-yellow-200">
                 <LogIn size={18} /> Masuk
               </button>
-              <p className="text-xs text-slate-500">Mockup: validasi peran sebenarnya dilakukan di sisi server.</p>
             </form>
           </Panel>
         </div>
@@ -458,7 +507,7 @@ function LoginPage({ onLogin }) {
   );
 }
 
-/* ---------- Header: profil & riwayat ---------- */
+/* ---------- Header & Riwayat Real-Time ---------- */
 function Profile({ user, onLogout }) {
   const r = ROLES[user.role];
   return (
@@ -476,40 +525,65 @@ function Profile({ user, onLogout }) {
 }
 
 function HistoryDrawer({ role, onClose }) {
+  const { logs, loading, clearLogs } = useRealtimeLogs(true);
+
   useEffect(() => {
     const h = (e) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   }, [onClose]);
+
   const admin = role === "admin";
   return (
     <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label="Riwayat kejadian">
       <button className="flex-1 bg-black/60" onClick={onClose} aria-label="Tutup riwayat" tabIndex={-1} />
-      <aside className="w-full sm:w-96 bg-gray-900 border-l border-slate-700 p-5 overflow-y-auto">
+      <aside className="w-full sm:w-96 bg-gray-900 border-l border-slate-700 p-5 overflow-y-auto flex flex-col">
         <div className="flex items-center justify-between mb-1">
-          <h2 className="bn-display text-2xl font-semibold text-slate-50">Riwayat kejadian</h2>
-          <button onClick={onClose} aria-label="Tutup" className="p-1 text-slate-400 hover:text-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400"><X size={20} /></button>
+          <h2 className="bn-display text-2xl font-semibold text-slate-50">Riwayat Real-Time</h2>
+          <div className="flex items-center gap-2">
+            {admin && logs.length > 0 && (
+              <button onClick={clearLogs} title="Bersihkan Riwayat" className="p-1.5 text-xs flex items-center gap-1 border border-slate-700 text-slate-400 hover:text-red-400 hover:border-red-500/50">
+                <Trash2 size={14} /> Bersihkan
+              </button>
+            )}
+            <button onClick={onClose} aria-label="Tutup" className="p-1 text-slate-400 hover:text-slate-100"><X size={20} /></button>
+          </div>
         </div>
-        <p className="text-sm text-slate-400 mb-4">{admin ? "Aktuator yang menyala hari ini" : "Kualitas udara terburuk hari ini (SO₂)"}</p>
-        <ul className="space-y-2">
-          {admin
-            ? ADMIN_LOG.map((e) => (
-                <li key={e.t + e.ev} className={`p-3 border-l-4 ${e.on ? "border-cyan-400 bg-cyan-400/10" : "border-slate-600 bg-slate-800/40"}`}>
-                  <div className="flex justify-between text-sm"><span className="font-medium text-slate-100">{e.ev}</span><span className="bn-display text-lg text-slate-300">{e.t}</span></div>
-                  <div className="text-xs text-slate-400 mt-0.5">{e.src}</div>
-                </li>
-              ))
-            : CITIZEN_LOG.map((e) => {
-                const s = SCALE[level(e.so2, LIMITS.so2)];
-                return (
-                  <li key={e.t} className="p-3 border-l-4 bg-slate-800/40 flex items-center justify-between" style={{ borderColor: s.hex }}>
-                    <div><div className={`text-sm font-medium ${s.text}`}>{s.label}</div><div className="text-xs text-slate-400">Pukul {e.t} WIB</div></div>
-                    <div className="bn-display text-3xl text-slate-100">{e.so2.toFixed(1).replace(".", ",")}<span className="text-sm text-slate-400 ml-1">ppm</span></div>
+        <p className="text-sm text-slate-400 mb-4">{admin ? "Log aktivasi aktuator & telemetri (Live Firebase)" : "Catatan lonjakan gas SO₂ (Live Firebase)"}</p>
+
+        {loading && logs.length === 0 ? (
+          <div className="text-sm text-slate-400 py-8 text-center">Memuat riwayat dari Firebase...</div>
+        ) : logs.length === 0 ? (
+          <div className="text-sm text-slate-500 py-8 text-center border border-dashed border-slate-800 p-4">
+            Belum ada kejadian tercatat. Tekan tombol Manual Override atau picu sensor SO₂ untuk melihat log real-time.
+          </div>
+        ) : (
+          <ul className="space-y-2 flex-1">
+            {admin
+              ? logs.map((e) => (
+                  <li key={e.id} className={`p-3 border-l-4 ${e.on ? "border-cyan-400 bg-cyan-400/10" : "border-slate-600 bg-slate-800/40"}`}>
+                    <div className="flex justify-between text-sm">
+                      <span className="font-medium text-slate-100">{e.ev}</span>
+                      <span className="bn-display text-lg text-slate-300">{e.t} WIB</span>
+                    </div>
+                    <div className="text-xs text-slate-400 mt-0.5">{e.src} {e.so2 != null ? `(SO₂: ${fmt1(Number(e.so2))} ppm)` : ""}</div>
                   </li>
-                );
-              })}
-        </ul>
-        <p className="text-xs text-slate-500 mt-4">Data contoh untuk mockup.</p>
+                ))
+              : logs.map((e) => {
+                  const valSo2 = Number(e.so2 ?? 0.3);
+                  const s = SCALE[level(valSo2, LIMITS.so2)];
+                  return (
+                    <li key={e.id} className="p-3 border-l-4 bg-slate-800/40 flex items-center justify-between" style={{ borderColor: s.hex }}>
+                      <div>
+                        <div className={`text-sm font-medium ${s.text}`}>{s.label} — {e.ev}</div>
+                        <div className="text-xs text-slate-400">Pukul {e.t} WIB</div>
+                      </div>
+                      <div className="bn-display text-3xl text-slate-100">{fmt1(valSo2)}<span className="text-sm text-slate-400 ml-1">ppm</span></div>
+                    </li>
+                  );
+                })}
+          </ul>
+        )}
       </aside>
     </div>
   );
@@ -528,22 +602,8 @@ function LoadingScreen({ status, error }) {
   return (
     <main className="grid place-items-center p-6" style={{ minHeight: "60vh" }} role="status" aria-busy="true">
       <div className="w-full max-w-sm text-center">
-        <svg viewBox="0 0 400 400" className="w-56 mx-auto" aria-hidden="true">
-          <defs>
-            <linearGradient id="bn-loadfill" x1="0" y1="0" x2="1" y2="0">
-              <stop offset="0%" stopColor={failing ? "#facc15" : "#22d3ee"} stopOpacity="0" />
-              <stop offset="100%" stopColor={failing ? "#facc15" : "#22d3ee"} stopOpacity=".3" />
-            </linearGradient>
-          </defs>
-          <circle cx="200" cy="200" r="184" fill="#080d13" stroke="#334155" strokeWidth="2" />
-          {[46, 92, 138].map((r) => <circle key={r} cx="200" cy="200" r={r} fill="none" stroke="#2b3a4d" strokeDasharray="3 5" />)}
-          <g className="bn-sweep"><path d="M200 200 L200 16 A184 184 0 0 1 330 70 Z" fill="url(#bn-loadfill)" /></g>
-          <circle className="bn-ping" cx="200" cy="200" r="70" fill="none" stroke={failing ? "#facc15" : "#22d3ee"} strokeWidth="2" />
-          <circle cx="200" cy="200" r="6" fill={failing ? "#facc15" : "#22d3ee"} />
-        </svg>
         <h2 className="bn-display text-2xl font-semibold text-slate-50 mt-5">{failing ? "Belum ada balasan dari database" : "Menghubungkan ke node Ijen"}</h2>
         <p className="text-sm text-slate-400 mt-1">{failing ? `${error}. Mencoba lagi otomatis tiap 2 detik.` : "Menunggu telemetri pertama dari Firebase."}</p>
-        <div className="relative h-1 bg-slate-800 mt-5 overflow-hidden"><div className={`bn-scan absolute inset-y-0 w-2/5 ${failing ? "bg-yellow-400" : "bg-cyan-400"}`} /></div>
       </div>
     </main>
   );
@@ -571,28 +631,18 @@ function Shell({ user, onLogout, conn, children }) {
             </div>
             <div className={`flex items-center gap-2 px-3 py-1.5 border ${CONN[conn.status].box}`}>
               <span className="relative flex w-2.5 h-2.5">
-                {conn.status === "online" && <span className="absolute inline-flex w-full h-full rounded-full bg-cyan-400 opacity-60 animate-ping motion-reduce:animate-none" />}
+                {conn.status === "online" && <span className="absolute inline-flex w-full h-full rounded-full bg-cyan-400 opacity-60 animate-ping" />}
                 <span className={`relative inline-flex w-2.5 h-2.5 rounded-full ${CONN[conn.status].dot}`} />
               </span>
               <Radio size={16} className={CONN[conn.status].tx} /><span className={`text-sm font-medium ${CONN[conn.status].tx}`}>{CONN[conn.status].txt}</span>
             </div>
-            <button onClick={() => setHistoryOpen(true)} className="flex items-center gap-2 px-3 py-1.5 border border-slate-600 text-sm text-slate-200 hover:bg-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400">
+            <button onClick={() => setHistoryOpen(true)} className="flex items-center gap-2 px-3 py-1.5 border border-slate-600 text-sm text-slate-200 hover:bg-slate-800">
               <HistoryIcon size={16} /> Riwayat
             </button>
             <Profile user={user} onLogout={onLogout} />
           </div>
         </div>
       </header>
-      {conn.hasData && (conn.status === "offline" || conn.status === "stale") && (
-        <div className={`border-b ${conn.status === "offline" ? "bg-red-500/10 border-red-500/40 text-red-200" : "bg-yellow-400/10 border-yellow-400/40 text-yellow-200"}`}>
-          <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 py-2 flex items-center gap-2 text-sm">
-            <TriangleAlert size={16} className="shrink-0" />
-            {conn.status === "offline"
-              ? `Koneksi ke database terputus. Menampilkan data terakhir pukul ${conn.lastTime} WIB.`
-              : `Node tidak mengirim data baru selama ${conn.ageSec} detik. Nilai di layar mungkin sudah tidak berlaku.`}
-          </div>
-        </div>
-      )}
       <div className="flex-1">{children}</div>
       <Footer />
       {historyOpen && <HistoryDrawer role={user.role} onClose={() => setHistoryOpen(false)} />}
@@ -613,75 +663,119 @@ function Stat({ label, value, note, color }) {
 
 function AdminView({ d }) {
   const [override, setOverride] = useState("idle");
+  const [urgentSim, setUrgentSim] = useState(null); // null = Sensor Real, "warn" = Waspada, "danger" = Urgent Bahaya
 
-  // Mengirim perintah Manual Override ke /control.json milik ESP32
+  // Gabungkan data sensor asli dengan mode simulasi prototipe jika diaktifkan
+  const activeData = useMemo(() => {
+    if (!urgentSim) return d;
+    if (urgentSim === "danger") {
+      return { ...d, so2: 6.8, h2s: 5.4, pump: true, solenoid: true, blower: true };
+    }
+    if (urgentSim === "warn") {
+      return { ...d, so2: 3.4, h2s: 1.8, blower: true };
+    }
+    return d;
+  }, [d, urgentSim]);
+
   const handleOverride = async (newState) => {
     setOverride(newState);
-    if (newState === "armed") return; // Tunggu konfirmasi klik kedua
+    if (newState === "armed") return;
 
     const isActive = newState === "engaged";
     try {
-      await fetch("https://bionets-abaa9-default-rtdb.asia-southeast1.firebasedatabase.app/control.json", {
+      await fetch(CONTROL_ENDPOINT, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mode: isActive ? "MANUAL_ON" : "AUTO",
           manual_aktif: isActive,
-          timestamp: Date.now()
-        })
+          timestamp: Date.now(),
+        }),
       });
-      console.log("Override berhasil dikirim:", isActive ? "MANUAL_ON" : "AUTO");
+      await pushFirebaseLog(
+        isActive ? "Mist Cannon & Solenoid diaktifkan paksa" : "Kendali dikembalikan ke Otomatis",
+        "Manual override oleh Admin BPBD via Command Center",
+        isActive,
+        activeData.so2
+      );
     } catch (err) {
-      console.error("Gagal mengirim perintah override:", err);
+      console.error("Gagal mengirim perintah ke Firebase:", err);
     }
   };
 
-  const bearing = bearingOf(d);
-  const lvl = overall(d);
+  const triggerUrgentDemo = async (lvlKey) => {
+    setUrgentSim(lvlKey);
+    if (lvlKey === "danger") {
+      await handleOverride("engaged");
+      await pushFirebaseLog("STATUS URGENT BAHAYA (Prototipe)", "Konsentrasi SO₂ menembus ambang kritis > 5,0 ppm", true, 6.8);
+    } else if (lvlKey === "warn") {
+      await pushFirebaseLog("STATUS WASPADA (Prototipe)", "Konsentrasi SO₂ meningkat ke 3,4 ppm", true, 3.4);
+    } else {
+      await handleOverride("idle");
+    }
+  };
+
+  const bearing = bearingOf(activeData);
+  const lvl = overall(activeData);
   const s = SCALE[lvl];
-  const litres = d.tankPct == null ? "--" : ((d.tankPct / 100) * TANK_CAP).toFixed(2).replace(".", ",");
-  const isManual = override === "engaged";
+  const litres = activeData.tankPct == null ? "--" : ((activeData.tankPct / 100) * TANK_CAP).toFixed(2).replace(".", ",");
+  const isManual = override === "engaged" || activeData.mode === "MANUAL_ON";
 
   return (
     <main className="max-w-screen-2xl mx-auto p-4 sm:p-6 grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6">
+      {/* Bar Simulasi Urgent Prototipe */}
+      <div className="lg:col-span-12 flex flex-wrap items-center justify-between gap-3 bg-slate-900 border border-slate-700 px-4 py-2.5 text-xs">
+        <span className="text-slate-300 font-medium">Mode Pengujian Prototipe (Simulasi Kadar PPM & Aktuator):</span>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={() => triggerUrgentDemo(null)} className={`px-3 py-1 border ${!urgentSim ? "border-cyan-400 bg-cyan-400/20 text-cyan-200 font-semibold" : "border-slate-600 text-slate-400"}`}>
+            Sensor Real ({fmt1(d.so2)} ppm)
+          </button>
+          <button onClick={() => triggerUrgentDemo("warn")} className={`px-3 py-1 border ${urgentSim === "warn" ? "border-yellow-400 bg-yellow-400/20 text-yellow-200 font-semibold" : "border-slate-600 text-slate-400"}`}>
+            Simulasi Waspada (3,4 ppm)
+          </button>
+          <button onClick={() => triggerUrgentDemo("danger")} className={`px-3 py-1 border ${urgentSim === "danger" ? "border-red-500 bg-red-500/30 text-red-200 font-semibold" : "border-slate-600 text-slate-400"}`}>
+            Trigger URGENT Bahaya (6,8 ppm + Auto Relay ON)
+          </button>
+        </div>
+      </div>
+
       <Panel title="Kesimpulan dan overview status" className="lg:col-span-12" aside={<ClipboardCheck size={18} className="text-slate-500" />}>
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <Stat label="Status keseluruhan" value={s.label} note="Ditentukan gas tertinggi" color={s.hex} />
-          <Stat label="SO₂ saat ini" value={`${fmt1(d.so2)} ppm`} note={`Ambang bahaya ${LIMITS.so2.danger} ppm`} color={d.so2 == null ? "#64748b" : TONE[level(d.so2, LIMITS.so2)].hex} />
-          <Stat label="Cairan tersisa" value={`${litres} L`} note={`${d.tankPct ?? "--"}% dari ${TANK_CAP} L`} color={d.tankPct == null ? "#64748b" : d.tankPct > 30 ? "#22d3ee" : "#facc15"} />
+          <Stat label="SO₂ saat ini" value={`${fmt1(activeData.so2)} ppm`} note={`Ambang bahaya ${LIMITS.so2.danger} ppm`} color={activeData.so2 == null ? "#64748b" : TONE[level(activeData.so2, LIMITS.so2)].hex} />
+          <Stat label="Cairan tersisa" value={`${litres} L`} note={`${activeData.tankPct ?? "--"}% dari ${TANK_CAP} L`} color={activeData.tankPct == null ? "#64748b" : activeData.tankPct > 30 ? "#22d3ee" : "#ef4444"} />
           <Stat label="Mode aktuator" value={isManual ? "Manual" : "Otomatis"} note={bearing == null ? "Arah angin tidak tersedia" : `Tiupan menuju ${bearing}° (${compass(bearing)})`} color={isManual ? "#ef4444" : "#22d3ee"} />
         </div>
         <p className="mt-4 text-slate-200">
           <span className="font-semibold text-slate-50">Rekomendasi: </span>{REKOMENDASI[lvl]}
-          {d.tankPct != null && d.tankPct < 30 && " Cadangan cairan menipis, rencanakan pengisian ulang."}
+          {activeData.tankPct != null && activeData.tankPct <= 15 && " [PERINGATAN: Tangki eco-alkaline sedang kosong/kritis, segera isi ulang!]"}
         </p>
       </Panel>
 
       <div className="lg:col-span-3 flex flex-col gap-4 sm:gap-6">
         <Panel title="Kualitas udara" aside={<Activity size={18} className="text-slate-500" />}>
-          <ArcGauge value={d.so2} label="Sulfur dioksida (SO₂)" unit="ppm" limits={LIMITS.so2} />
+          <ArcGauge value={activeData.so2} label="Sulfur dioksida (SO₂)" unit="ppm" limits={LIMITS.so2} />
           <div className="h-px bg-slate-800 my-4" />
-          <ArcGauge value={d.h2s} label="Hidrogen sulfida (H₂S)" unit="ppm" limits={LIMITS.h2s} />
+          <ArcGauge value={activeData.h2s} label="Hidrogen sulfida (H₂S)" unit="ppm" limits={LIMITS.h2s} />
         </Panel>
         <Panel title="Kondisi lingkungan">
           <div className="grid grid-cols-2 gap-3">
-            <Metric icon={Thermometer} label="Suhu" value={d.temp} unit="°C" pct={pctOf(d.temp, 50)} />
-            <Metric icon={Droplet} label="Kelembapan" value={d.hum} unit="%" pct={pctOf(d.hum, 100)} />
+            <Metric icon={Thermometer} label="Suhu" value={fmt1(activeData.temp)} unit="°C" pct={pctOf(activeData.temp, 50)} />
+            <Metric icon={Droplet} label="Kelembapan" value={fmt1(activeData.hum)} unit="%" pct={pctOf(activeData.hum, 100)} />
           </div>
         </Panel>
       </div>
       <div className="lg:col-span-6 flex flex-col gap-4 sm:gap-6">
-        <Panel title="Angin" aside={<Wind size={18} className="text-slate-500" />}><WindCompass from={d.windFrom} speed={d.windSpeed} /></Panel>
+        <Panel title="Angin" aside={<Wind size={18} className="text-slate-500" />}><WindCompass from={activeData.windFrom} speed={activeData.windSpeed} /></Panel>
         <Panel title="Sebaran gas"><SpatialRadar bearing={bearing} /></Panel>
       </div>
       <div className="lg:col-span-3 flex flex-col gap-4 sm:gap-6">
-        <Panel title="Tangki eco-alkaline 5,5 L"><Tank pct={d.tankPct} cap={TANK_CAP} /></Panel>
+        <Panel title="Tangki eco-alkaline 5,5 L"><Tank pct={activeData.tankPct} cap={TANK_CAP} cm={activeData.tankCm} /></Panel>
         <Panel title="Status aktuator">
           <div className="flex flex-col gap-3">
-            {/* Menggunakan operator || agar indikator langsung menyala begitu override aktif maupun saat ESP32 merespons */}
-            <Actuator icon={Droplets} name="Pompa misting (mist cannon)" on={Boolean(d.pump || isManual)} offText="Siaga" />
-            <Actuator icon={Zap} name="Solenoid valve" on={Boolean(d.solenoid || isManual)} onText="Terbuka" offText="Tertutup" />
-            <Actuator icon={Fan} name="Blower fan" on={Boolean(d.blower || isManual)} offText="Mati" />
+            <Actuator icon={Droplets} name="Pompa misting (mist cannon)" on={Boolean(activeData.pump || isManual)} offText="Siaga" />
+            <Actuator icon={Zap} name="Solenoid valve" on={Boolean(activeData.solenoid || isManual)} onText="Terbuka" offText="Tertutup" />
+            <Actuator icon={Fan} name="Blower fan" on={Boolean(activeData.blower || isManual)} offText="Mati" />
           </div>
         </Panel>
         <Panel title="Kendali manual"><OverrideButton state={override} setState={handleOverride} /></Panel>
@@ -728,7 +822,6 @@ function CitizenStatus({ d }) {
         <Block title="Petani belerang" items={a.petani} icon={Mountain} />
         <Block title="Warga" items={a.warga} icon={Home} />
       </div>
-      <p className="text-xs text-slate-500 mt-5">Teks bahasa Madura masih draf dan perlu diverifikasi penutur asli.</p>
     </Panel>
   );
 }
@@ -745,8 +838,8 @@ function CitizenView({ d }) {
         </Panel>
         <Panel title="Kondisi lingkungan">
           <div className="grid grid-cols-2 gap-3">
-            <Metric icon={Thermometer} label="Suhu" value={d.temp} unit="°C" pct={pctOf(d.temp, 50)} />
-            <Metric icon={Droplet} label="Kelembapan" value={d.hum} unit="%" pct={pctOf(d.hum, 100)} />
+            <Metric icon={Thermometer} label="Suhu" value={fmt1(d.temp)} unit="°C" pct={pctOf(d.temp, 50)} />
+            <Metric icon={Droplet} label="Kelembapan" value={fmt1(d.hum)} unit="%" pct={pctOf(d.hum, 100)} />
           </div>
         </Panel>
       </div>
@@ -759,7 +852,6 @@ function CitizenView({ d }) {
   );
 }
 
-/* ---------- Root: percabangan berdasarkan peran ---------- */
 function RoleView({ role, d }) {
   if (role === "admin") return <AdminView d={d} />;
   return <CitizenView d={d} />;
